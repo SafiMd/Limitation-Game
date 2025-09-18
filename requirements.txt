@@ -1,7 +1,3 @@
 discord.py==2.3.2
-<<<<<<< HEAD
-=======
-
->>>>>>> 5b2a1bb (fix: clean requirements.txt with valid dependencies)
 openai>=1.30.0
 python-dotenv>=1.0.1

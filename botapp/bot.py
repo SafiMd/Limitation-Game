@@ -1,6 +1,10 @@
 import discord
 from discord.ext import commands
-from src import config
+import discord
+from discord.ext import commands
+from botapp import config
+from botapp.game_manager import GameManager
+
 from botapp.game_manager import GameManager
 
 intents = discord.Intents.default()
