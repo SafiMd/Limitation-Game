@@ -33,14 +33,12 @@ def normalize_answer(text: str) -> str:
 async def human_like_send(channel: discord.abc.Messageable, label: str, text: str):
     """Send with a short typing delay so timing doesn't give away the AI."""
     text = normalize_answer(text)
-    # pretend to type
     delay = MIN_TYPING_DELAY + PER_CHAR_DELAY * min(len(text), 400)
     delay += random.uniform(*JITTER_DELAY)
     try:
         async with channel.typing():
             await asyncio.sleep(delay)
     except Exception:
-        # Some channel types don't support typing()—fallback to a normal delay
         await asyncio.sleep(delay)
     await channel.send(f"**{label}:** {text}")
 
@@ -52,7 +50,7 @@ async def human_like_send(channel: discord.abc.Messageable, label: str, text: st
 class GameState:
     def __init__(self, guild: discord.Guild, channel: discord.TextChannel):
         self.guild = guild
-        self.channel = channel
+        self.channel = channel                # parent text channel
         self.humans: list[discord.Member] = []
         self.interrogator: Optional[discord.Member] = None
         self.human_contestant: Optional[discord.Member] = None
@@ -68,33 +66,41 @@ class GameState:
 
 class GameManager:
     """
-    Full Imitation Game manager:
+    Imitation Game manager (judge + 1 human + AI):
       - Lobby (create_lobby, join)
-      - Start (role randomization, DM role info, create thread)
-      - Q&A loop (relay_question): judge asks; bot collects human DM + AI answer
-      - Guess (final_guess): judge declares X/Y; bot reveals, logs, ends
-      - End (graceful cleanup)
+      - Start (judge = command invoker, human = single joiner, AI label randomized)
+      - Q&A loop (relay_question): judge asks in thread; bot collects human DM + AI answer
+      - Guess (final_guess): judge declares A/B; bot reveals, ends
+      - End (cleanup)
     """
     def __init__(self):
-        self.games: Dict[int, GameState] = {}  # key: channel.id (the parent text channel)
+        # store under parent channel id, and also under thread id when created
+        self.games: Dict[int, GameState] = {}
 
     # --------------- lifecycle helpers
 
-    def get_game(self, guild: discord.Guild, channel: discord.TextChannel) -> GameState:
-        if channel.id not in self.games:
-            self.games[channel.id] = GameState(guild, channel)
-        return self.games[channel.id]
+    def _key_for_channel(self, channel: discord.abc.GuildChannel | discord.Thread) -> int:
+        """Use the parent id when in a thread, otherwise channel id."""
+        if isinstance(channel, discord.Thread):
+            return channel.parent.id
+        return channel.id
+
+    def get_game(self, guild: discord.Guild, channel: discord.abc.GuildChannel | discord.Thread) -> GameState:
+        key = self._key_for_channel(channel)
+        if key not in self.games:
+            parent = channel.parent if isinstance(channel, discord.Thread) else channel
+            self.games[key] = GameState(guild, parent)  # type: ignore[arg-type]
+        return self.games[key]
 
     async def _dm(self, member: discord.Member, content: str):
         try:
             dm = await member.create_dm()
             await dm.send(content)
         except discord.Forbidden:
-            # Surface this to the game thread instead of failing
             return False
         return True
 
-    # --------------- commands called from your bot cog/command handlers
+    # --------------- commands called from your bot command handlers
 
     async def create_lobby(self, ctx):
         game = self.get_game(ctx.guild, ctx.channel)
@@ -104,8 +110,8 @@ class GameManager:
         game.reset()
         await ctx.send(
             "**Imitation Game lobby created!**\n"
-            "Two humans: run `!join` to join.\n"
-            "When two humans have joined, run `!start` to assign roles and create the thread."
+            "Exactly **one** human should run `!join` to be the contestant.\n"
+            "Then the **judge** (you) run `!start` to begin."
         )
 
     async def join(self, ctx, member: discord.Member):
@@ -116,25 +122,25 @@ class GameManager:
         if member in game.humans:
             await ctx.send("You already joined.")
             return
-        if len(game.humans) >= 2:
-            await ctx.send("Lobby full. (Need exactly two humans.)")
+        if len(game.humans) >= 1:
+            await ctx.send("Lobby full. (Need exactly one human.)")
             return
         game.humans.append(member)
-        await ctx.send(f"{member.mention} joined. ({len(game.humans)}/2)")
+        await ctx.send(f"{member.mention} joined as the **human contestant**. (1/1)")
 
     async def start(self, ctx):
         game = self.get_game(ctx.guild, ctx.channel)
         if game.running:
             await ctx.send("Game already running.")
             return
-        if len(game.humans) != 2:
-            await ctx.send("Need exactly two humans to start.")
+        if len(game.humans) != 1:
+            await ctx.send("Need exactly **one** human to start. Ask them to run `!join`.")
             return
 
-        # Randomize interrogator vs human contestant
-        game.interrogator, game.human_contestant = random.sample(game.humans, 2)
-        # Randomize whether A or B is AI
-        game.ai_is_A = random.choice([True, False])
+        # Deterministic roles
+        game.interrogator = ctx.author                # judge = command invoker
+        game.human_contestant = game.humans[0]        # the single joiner
+        game.ai_is_A = random.choice([True, False])   # AI is A or B
 
         # Create a thread for the interrogation
         game.thread = await ctx.channel.create_thread(
@@ -144,10 +150,13 @@ class GameManager:
         game.running = True
         game.rounds_done = 0
 
-        # DM role info with anonymity instructions
+        # Also index by thread id so calls inside the thread resolve correctly
+        self.games[game.thread.id] = game
+
+        # DM role info
         judge_ok = await self._dm(
             game.interrogator,
-            "You are the **Interrogator**. Ask questions *in the game thread*.\n"
+            "You are the **Interrogator (Judge)**. Ask questions *in the game thread*.\n"
             "Contestants appear only as **A** and **B**.\n"
             "End the game with `!who A` or `!who B` when you’re ready to guess."
         )
@@ -157,27 +166,26 @@ class GameManager:
             "You are the **Human Contestant**.\n"
             f"Your label is **{human_label}**.\n"
             "I’ll DM you each question—reply to me with your answer (plain text). "
-            "Keep it short and natural; I’ll forward it anonymously into the thread."
+            "Keep it short and natural; I’ll forward it anonymously to the thread."
         )
 
         if not (judge_ok and human_ok):
-            await ctx.send("⚠️ I couldn't DM one or both players. Make sure DMs from server members are enabled.")
+            await ctx.send("⚠️ I couldn't DM one or both players. Enable DMs from server members.")
 
         await game.thread.send(
-            f"**Game started!** {game.interrogator.mention} is Interrogator.\n\n"
-            "Ask your first question here with `!ask <question>`.\n"
+            f"**Game started!** {game.interrogator.mention} is the Judge.\n\n"
+            "Judge: ask your first question here with `!ask <question>`.\n"
             "I will collect answers from **A** and **B** and post them with fair timing."
         )
 
     async def relay_question(self, ctx, question: str):
         """
-        When the interrogator posts a question in the thread, collect:
-          1) Human contestant's DM.
-          2) AI answer from OpenAI.
-        Then post both as 'A:' and 'B:' (A/B mapping fixed for the whole game).
+        Judge posts a question in the thread:
+          1) DM the human for their answer
+          2) Get AI answer
+          3) Post both as A/B (mapping fixed for whole game)
         """
         game = self.get_game(ctx.guild, ctx.channel)
-        # must be running, in its thread, and asked by the interrogator
         if not (game.running and game.thread and isinstance(ctx.channel, discord.Thread)):
             return await ctx.send("No active game in this thread.")
         if ctx.channel.id != game.thread.id:
@@ -191,14 +199,15 @@ class GameManager:
 
         await game.thread.send(f"**Q{game.rounds_done} (Judge):** {question}")
 
-        # --- 1) kick off AI answer
+        # ---- AI (sync client) -> run in executor
         async def get_ai() -> str:
             try:
-                return await ai_client.ai_reply(question)
+                loop = asyncio.get_running_loop()
+                return await loop.run_in_executor(None, ai_client.ai_reply, question)
             except Exception:
                 return "…(no answer)"
 
-        # --- 2) prompt human in DM and wait for their DM
+        # ---- Human via DM
         async def get_human() -> str:
             try:
                 dm = await game.human_contestant.create_dm()
@@ -207,16 +216,10 @@ class GameManager:
                 return "(Human DM unavailable)"
 
             def check(m: discord.Message):
-                return (
-                    m.author.id == game.human_contestant.id
-                    and m.channel == dm
-                    and m.content
-                )
+                return m.author.id == game.human_contestant.id and m.channel == dm and m.content
 
             try:
-                msg: discord.Message = await ctx.bot.wait_for(
-                    "message", check=check, timeout=MAX_HUMAN_WAIT_S
-                )
+                msg: discord.Message = await ctx.bot.wait_for("message", check=check, timeout=MAX_HUMAN_WAIT_S)
                 return msg.content.strip()
             except asyncio.TimeoutError:
                 return "(no human answer)"
@@ -229,7 +232,6 @@ class GameManager:
         text_A = ai_text if game.ai_is_A else human_text
         text_B = human_text if game.ai_is_A else ai_text
 
-        # Post with short typing delays for fairness
         await human_like_send(game.thread, "A", text_A)
         await human_like_send(game.thread, "B", text_B)
 
@@ -283,5 +285,10 @@ class GameManager:
             except Exception:
                 pass
 
-        # Reset state for this parent channel
+        # Clean up both keys (parent + thread)
+        parent_key = self._key_for_channel(game.channel)
+        self.games.pop(parent_key, None)
+        if game.thread:
+            self.games.pop(game.thread.id, None)
+
         game.reset()
